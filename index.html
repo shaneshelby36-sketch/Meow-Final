@@ -294,17 +294,6 @@
             </div>
             <span class="field-hint">Recommended <strong>BTC · ETH</strong> (Core setup). Tap a setup card in the MODEL tab instead of guessing.</span>
           </div>
-          <label>Daily loss limit ($)
-            <div class="stepper-row">
-              <button type="button" class="stepper-btn" id="bot-daily-loss-down">−</button>
-              <span class="stepper-value" id="bot-daily-loss-value">—</span>
-              <button type="button" class="stepper-btn" id="bot-daily-loss-up">+</button>
-            </div>
-            <div id="daily-loss-reset-row" style="display:none;margin-top:6px;">
-              <button type="button" class="btn-secondary" id="daily-loss-reset-btn" style="color:var(--down,#e55);border-color:var(--down,#e55);">🛑 Halted — Reset daily loss limit</button>
-            </div>
-            <span class="field-hint">Kill-switch: halt all new entries for the rest of the day once realized losses hit this amount. Resets at midnight UTC. Default <strong>$5</strong>. <strong>$0</strong> = off.</span>
-          </label>
           <label>Stake per trade
             <div class="slider-row">
               <input id="bot-stake" type="range" min="1" max="500" step="1" />
