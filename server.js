@@ -685,6 +685,18 @@ app.get("/", (req, res) => {
     res.status(result.ok ? 200 : 400).json(result);
   });
 
+  app.post('/api/bot/reset-daily-loss', (req, res) => {
+    if (!bot) {
+      res.status(404).json({ enabled: false, message: 'Bot is not enabled (set KALSHI_ENABLED=true).' });
+      return;
+    }
+    bot._dailyLossHaltedAt = null;
+    bot._dailyLossCents = null;
+    bot._dailyLossResetAt = Date.now();
+    bot._logActivity('Daily loss limit reset by user — trading resumed.', { kind: 'info' });
+    res.json({ ok: true });
+  });
+
   app.post('/api/bot/reset-paper', (req, res) => {
     if (!bot) {
       res.status(404).json({ enabled: false, message: 'Bot is not enabled (set KALSHI_ENABLED=true).' });
