@@ -1,0 +1,36 @@
+{
+  "updatedAt": "2026-08-24T00:41:05.373Z",
+  "count": 1,
+  "trades": [
+    {
+      "id": "t1",
+      "mode": "paper",
+      "symbol": "ETH",
+      "ticker": "T",
+      "side": "yes",
+      "contracts": 10,
+      "stakeDollars": 5,
+      "entryPriceCents": 55,
+      "exitPriceCents": 52,
+      "openedAt": 1787532050362,
+      "closedAt": 1787532065372,
+      "windowCloseTime": 1787532785362,
+      "engineProbability": 55,
+      "engineConfidence": 70,
+      "status": "closed",
+      "exitReason": "model_against",
+      "pnlCents": -30,
+      "pnlGrossCents": -30,
+      "feesCents": 0,
+      "entryFeesCents": 0,
+      "exitFeesCents": 0,
+      "skimmedCents": 0,
+      "insuranceAddedCents": 0,
+      "insuranceDrawnCents": 0,
+      "insuranceOverflowCents": 0,
+      "insuranceReleasedCents": 0,
+      "stopVerdictPending": false,
+      "updatedAt": 1787532065373
+    }
+  ]
+}

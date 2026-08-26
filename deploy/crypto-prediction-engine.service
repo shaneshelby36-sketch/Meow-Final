@@ -1,0 +1,20 @@
+[Unit]
+Description=Crypto Prediction Engine (Coinbase feed + Kalshi bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=btcbot
+Group=btcbot
+WorkingDirectory=/opt/crypto-prediction-engine
+EnvironmentFile=-/opt/crypto-prediction-engine/.env
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+
+# The Node process owns the feed, predictions, and bot cycles.
+# Closing browser tabs does not stop this service.
+
+[Install]
+WantedBy=multi-user.target

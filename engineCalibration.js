@@ -1,230 +1,241 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const { DATA_DIR, writeJsonAtomic } = require('./paths');
+/**
+ * Maps raw engine probabilities to empirically observed hit rates from the
+ * tracker (when enough samples exist). Without this, a logistic "72%" is just
+ * a score — not a real chance of being right vs the Kalshi strike.
+ *
+ * Blend grows with bucket maturity so thin samples don't yank live probs.
+ */
 
-const COORD_FILENAME = 'bot-coordination.json';
-/** Primary must refresh within this window or backup treats it as offline. */
-const COORD_STALE_MS_DEFAULT = 90_000;
-/** Backup only rescues after primary has been retrying an exit this long. */
-const BACKUP_RESCUE_MIN_STUCK_MS_DEFAULT = 12_000;
+const MIN_TRADES_TO_BLEND = 40;
+const FULL_BLEND_TRADES = 200;
 
-function botRole() {
-  const r = String(process.env.BOT_ROLE || 'primary').toLowerCase();
-  return r === 'backup' ? 'backup' : 'primary';
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
 }
 
-function isPrimaryBotRole() {
-  return botRole() === 'primary';
+function bucketLabel(probabilityOfCalledDirection) {
+  const p = Number(probabilityOfCalledDirection);
+  if (!Number.isFinite(p)) return '50-59%';
+  if (p >= 90) return '90-100%';
+  const floor = Math.floor(p / 10) * 10;
+  return `${floor}-${floor + 9}%`;
 }
 
-function isBackupBotRole() {
-  return botRole() === 'backup';
+function maturityForTrades(trades) {
+  const n = Number(trades) || 0;
+  if (n >= 200) return 'reliable';
+  if (n >= 100) return 'good';
+  if (n >= 40) return 'developing';
+  return 'insufficient';
 }
 
-function botInstanceId() {
-  const id = process.env.BOT_INSTANCE_ID;
-  if (id && String(id).trim()) return String(id).trim();
-  return `bot-${process.pid}`;
-}
-
-function coordinationDir() {
-  if (process.env.BOT_COORD_DIR) return path.resolve(process.env.BOT_COORD_DIR);
-  return DATA_DIR;
-}
-
-function coordinationPath() {
-  return path.join(coordinationDir(), COORD_FILENAME);
-}
-
-function coordStaleMs(config = {}) {
-  const n = Number(config.botCoordStaleMs);
-  if (Number.isFinite(n) && n > 0) return Math.round(n);
-  const env = Number(process.env.BOT_COORD_STALE_MS);
-  if (Number.isFinite(env) && env > 0) return Math.round(env);
-  return COORD_STALE_MS_DEFAULT;
-}
-
-function backupRescueMinStuckMs(config = {}) {
-  const n = Number(config.botBackupRescueMinStuckMs);
-  if (Number.isFinite(n) && n >= 0) return Math.round(n);
-  const env = Number(process.env.BOT_BACKUP_RESCUE_MIN_STUCK_MS);
-  if (Number.isFinite(env) && env >= 0) return Math.round(env);
-  return BACKUP_RESCUE_MIN_STUCK_MS_DEFAULT;
-}
-
-function loadCoordination() {
-  try {
-    const p = coordinationPath();
-    if (!fs.existsSync(p)) return null;
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-    return raw && typeof raw === 'object' ? raw : null;
-  } catch {
-    return null;
-  }
-}
-
-function isCoordinationFresh(coord, now = Date.now(), config = {}) {
-  if (!coord || !Number.isFinite(Number(coord.updatedAt))) return false;
-  return now - Number(coord.updatedAt) <= coordStaleMs(config);
-}
-
-function serializeOpenTrade(trade) {
-  if (!trade || String(trade.status) !== 'open') return null;
-  const ticker = String(trade.ticker || '');
-  if (!ticker) return null;
-  return {
-    id: trade.id,
-    ticker,
-    symbol: String(trade.symbol || '').toUpperCase(),
-    side: String(trade.side || '').toLowerCase(),
-    windowCloseTime: trade.windowCloseTime,
-    pendingForceExit: trade.pendingForceExit ? String(trade.pendingForceExit) : null,
-    pendingForceExitSince: Number(trade.pendingForceExitSince) || null,
-    entryPriceCents: Number(trade.entryPriceCents),
-    contracts: Number(trade.contracts),
-    strategy: trade.strategy || 'model',
-    mode: trade.mode || 'live',
-    status: 'open',
-  };
-}
-
-/** Primary publishes open inventory so backup can enforce one-bot-per-window. */
-function publishPrimaryCoordination({ openTrades, instanceId, now = Date.now() } = {}) {
-  if (!isPrimaryBotRole()) return null;
-  const payload = {
-    role: 'primary',
-    instanceId: instanceId || botInstanceId(),
-    updatedAt: now,
-    openTrades: (openTrades || [])
-      .map(serializeOpenTrade)
-      .filter(Boolean),
-  };
-  writeJsonAtomic(coordinationPath(), payload);
-  return payload;
-}
-
-function primaryOpenOnTicker(coord, ticker) {
-  if (!coord || String(coord.role) !== 'primary') return null;
-  const t = String(ticker || '');
-  if (!t) return null;
-  return (coord.openTrades || []).find(
-    (row) => row && row.status === 'open' && String(row.ticker) === t
-  ) || null;
-}
-
-function primaryOpenOnWindow(coord, { ticker, symbol, windowCloseTime } = {}) {
-  const byTicker = primaryOpenOnTicker(coord, ticker);
-  if (byTicker) return byTicker;
-  const sym = String(symbol || '').toUpperCase();
-  const close = Number(windowCloseTime);
-  if (!sym || !Number.isFinite(close)) return null;
-  return (
-    (coord.openTrades || []).find((row) => {
-      if (!row || row.status !== 'open') return false;
-      if (String(row.symbol || '').toUpperCase() !== sym) return false;
-      return Number(row.windowCloseTime) === close;
-    }) || null
-  );
+function blendWeight(trades) {
+  const n = Number(trades) || 0;
+  if (n < MIN_TRADES_TO_BLEND) return 0;
+  return clamp((n - MIN_TRADES_TO_BLEND) / (FULL_BLEND_TRADES - MIN_TRADES_TO_BLEND), 0, 1);
 }
 
 /**
- * Backup must not enter when primary already holds this market/window.
- * Primary always allowed.
+ * Look up empirical P(correct | called-direction bucket) for one window.
+ * Returns null when there isn't enough data to trust.
  */
-function checkBackupEntryAllowed({
-  coord,
-  ticker,
-  symbol,
-  windowCloseTime,
-  now = Date.now(),
-  config = {},
-} = {}) {
-  if (!isBackupBotRole()) return { ok: true };
-  if (!coord || !isCoordinationFresh(coord, now, config)) {
-    return {
-      ok: false,
-      reason:
-        'Backup bot: primary coordination missing or stale — entries blocked (rescue-only).',
-    };
-  }
-  const held = primaryOpenOnWindow(coord, { ticker, symbol, windowCloseTime });
-  if (held) {
-    return {
-      ok: false,
-      reason:
-        `Backup bot: primary holds ${held.symbol} ${String(held.side || '').toUpperCase()} ` +
-        `on this window — no second entry.`,
-      primaryTrade: held,
-    };
-  }
-  return { ok: true };
-}
-
-/** Primary trades stuck on a force-retry exit — backup may sell to flatten. */
-function backupRescueCandidates(coord, { now = Date.now(), config = {} } = {}) {
-  if (!coord || String(coord.role) !== 'primary') return [];
-  if (!isCoordinationFresh(coord, now, config)) return [];
-  const minStuck = backupRescueMinStuckMs(config);
-  return (coord.openTrades || []).filter((row) => {
-    if (!row || row.status !== 'open') return false;
-    const reason = row.pendingForceExit;
-    if (!reason) return false;
-    const since = Number(row.pendingForceExitSince);
-    if (!Number.isFinite(since)) return minStuck <= 0;
-    return now - since >= minStuck;
-  });
-}
-
-function coordinationTradeStub(row) {
-  if (!row) return null;
+function lookupEmpiricalCalledRate(calibration, symbol, windowKey, calledProbPct) {
+  const bySym = calibration && calibration[symbol];
+  const byWin = bySym && bySym[windowKey];
+  if (!byWin || typeof byWin !== 'object') return null;
+  const label = bucketLabel(calledProbPct);
+  const cell = byWin[label];
+  if (!cell) return null;
+  const trades = Number(cell.trades) || 0;
+  const wins = Number(cell.wins) || 0;
+  if (trades < MIN_TRADES_TO_BLEND || wins < 0) return null;
   return {
-    id: row.id,
-    ticker: row.ticker,
-    symbol: row.symbol,
-    side: row.side,
-    contracts: row.contracts,
-    entryPriceCents: row.entryPriceCents,
-    windowCloseTime: row.windowCloseTime,
-    strategy: row.strategy || 'model',
-    mode: row.mode || 'live',
-    status: 'open',
-    backupRescue: true,
+    label,
+    trades,
+    wins,
+    rate: wins / trades,
+    maturity: maturityForTrades(trades),
+    weight: blendWeight(trades),
   };
 }
 
-function noteBackupRescueAttempt({ tradeId, ticker, reason, ok, detail, now = Date.now() } = {}) {
-  const coord = loadCoordination() || { role: 'primary', openTrades: [] };
-  coord.lastBackupRescue = {
-    at: now,
-    instanceId: botInstanceId(),
-    tradeId,
-    ticker,
-    reason,
-    ok: !!ok,
-    detail: detail ? String(detail) : '',
+/**
+ * Calibrate a 0..1 P(up). Softens confidence toward historical hit rate for
+ * that bucket — but NEVER flips the call. If the bucket is historically
+ * wrong (<50%), we shrink toward a coin-flip, not reverse Buy↔Sell.
+ */
+function calibrateProbabilityUp(pUp01, { symbol, windowKey, calibration } = {}) {
+  const raw = clamp(Number(pUp01), 0, 1);
+  if (!Number.isFinite(raw) || !calibration || !symbol || !windowKey) {
+    return { probabilityUp: raw, calibrated: false };
+  }
+  const calledUp = raw >= 0.5;
+  const calledProbPct = Math.max(raw, 1 - raw) * 100;
+  const emp = lookupEmpiricalCalledRate(calibration, symbol, windowKey, calledProbPct);
+  if (!emp || emp.weight <= 0) {
+    return { probabilityUp: raw, calibrated: false, bucket: bucketLabel(calledProbPct) };
+  }
+  const rawCalled = calledProbPct / 100;
+  // Reliability floored at 50%: bad buckets only erase edge, they don't invert.
+  const reliableRate = Math.max(0.5, emp.rate);
+  const blendedCalled = rawCalled * (1 - emp.weight) + reliableRate * emp.weight;
+  const calledClamped = clamp(Math.max(0.5, blendedCalled), 0.5, 0.98);
+  const probabilityUp = calledUp ? calledClamped : 1 - calledClamped;
+  return {
+    probabilityUp: clamp(probabilityUp, 0.02, 0.98),
+    calibrated: true,
+    bucket: emp.label,
+    empiricalRate: emp.rate,
+    blendWeight: emp.weight,
+    maturity: emp.maturity,
+    trades: emp.trades,
+    directionPreserved: true,
   };
-  writeJsonAtomic(coordinationPath(), coord);
+}
+
+/**
+ * Mutate a window prediction in place: keep raw probs, overwrite displayed
+ * probabilityUp/Down with the calibrated values when available.
+ */
+function applyCalibrationToWindow(windowPred, { symbol, windowKey, calibration } = {}) {
+  if (!windowPred || typeof windowPred !== 'object') return windowPred;
+  const rawUp = Number(windowPred.probabilityUpRaw != null
+    ? windowPred.probabilityUpRaw
+    : windowPred.probabilityUp);
+  if (!Number.isFinite(rawUp)) return windowPred;
+  if (windowPred.probabilityUpRaw == null) {
+    windowPred.probabilityUpRaw = +rawUp.toFixed(1);
+    windowPred.probabilityDownRaw = +(100 - rawUp).toFixed(1);
+  }
+  const result = calibrateProbabilityUp(rawUp / 100, { symbol, windowKey, calibration });
+  const pUp = result.probabilityUp * 100;
+  windowPred.probabilityUp = +pUp.toFixed(1);
+  windowPred.probabilityDown = +(100 - pUp).toFixed(1);
+  windowPred.calibrated = result.calibrated === true;
+  if (result.calibrated) {
+    windowPred.calibration = {
+      bucket: result.bucket,
+      empiricalRatePct: +(result.empiricalRate * 100).toFixed(1),
+      blendWeight: +result.blendWeight.toFixed(2),
+      maturity: result.maturity,
+      trades: result.trades,
+    };
+  } else {
+    windowPred.calibration = { bucket: result.bucket || null, maturity: 'insufficient' };
+  }
+  return windowPred;
+}
+
+/**
+ * After all three windows exist: reward unanimous lean, shrink/dock outliers.
+ * Operates on percentage probs (mutates windows).
+ */
+function applyWindowConsensus(windows) {
+  if (!windows || !windows.w5 || !windows.w10 || !windows.w15) {
+    return { agreeCount: 0, unanimous: false };
+  }
+  const keys = ['w5', 'w10', 'w15'];
+  const dirs = keys.map((k) => (Number(windows[k].probabilityUp) >= 50 ? 1 : -1));
+  const upVotes = dirs.filter((d) => d > 0).length;
+  const majorityDir = upVotes >= 2 ? 1 : -1;
+  const agreeCount = dirs.filter((d) => d === majorityDir).length;
+  const unanimous = agreeCount === 3;
+
+  for (let i = 0; i < keys.length; i++) {
+    const w = windows[keys[i]];
+    const agrees = dirs[i] === majorityDir;
+    let conf = Number(w.confidence);
+    let pUp = Number(w.probabilityUp);
+    if (!Number.isFinite(conf) || !Number.isFinite(pUp)) continue;
+
+    if (unanimous) {
+      conf = Math.min(95, conf + 4);
+      // Slightly sharpen lean when all horizons agree (still bounded).
+      const edge = pUp - 50;
+      pUp = 50 + edge * 1.06;
+    } else if (!agrees) {
+      conf = Math.max(8, conf - 12);
+      // Pull disagreeing window toward coin-flip — often the noisy short horizon.
+      pUp = 50 + (pUp - 50) * 0.55;
+      const notes = Array.isArray(w.consensusNotes) ? w.consensusNotes : [];
+      notes.push('Disagrees with majority of horizons — shrunk toward 50%');
+      w.consensusNotes = notes;
+    } else if (agreeCount === 2) {
+      conf = Math.min(95, conf + 1);
+    }
+
+    w.confidence = Math.round(clamp(conf, 8, 95));
+    w.probabilityUp = +clamp(pUp, 1, 99).toFixed(1);
+    w.probabilityDown = +(100 - w.probabilityUp).toFixed(1);
+  }
+
+  const consensus = {
+    agreeCount,
+    unanimous,
+    majorityDirection: majorityDir > 0 ? 'UP' : 'DOWN',
+  };
+  for (const k of keys) {
+    windows[k].consensus = consensus;
+  }
+  return consensus;
+}
+
+/** Entry helper: does this side match the multi-window majority? */
+function windowConsensusSupportsSide(windows, side) {
+  if (!windows || !windows.w5 || !windows.w10 || !windows.w15) return true;
+  const c = windows.w5.consensus || applyWindowConsensus(windows);
+  if (!c || c.agreeCount < 2) return false;
+  if (side === 'yes') return c.majorityDirection === 'UP';
+  if (side === 'no') return c.majorityDirection === 'DOWN';
+  return false;
+}
+
+/**
+ * Skip entries when this confidence bucket historically loses money / is wrong,
+ * once we have developing+ samples. Thin data → allow (don't starve early).
+ */
+function modelCalibrationEntryGate({
+  symbol,
+  windowKey,
+  probabilityUp,
+  side,
+  calibration,
+  minWinRatePct = 52,
+} = {}) {
+  if (!calibration || !symbol || !windowKey) return { ok: true };
+  const pUp = Number(probabilityUp);
+  if (!Number.isFinite(pUp)) return { ok: true };
+  const heldProb = side === 'yes' ? pUp : 100 - pUp;
+  const calledProb = Math.max(heldProb, 100 - heldProb);
+  const emp = lookupEmpiricalCalledRate(calibration, symbol, windowKey, calledProb);
+  if (!emp) return { ok: true };
+  const winRatePct = emp.rate * 100;
+  if (winRatePct + 1e-9 < minWinRatePct) {
+    return {
+      ok: false,
+      reason:
+        `calibrated ${emp.label} only ${winRatePct.toFixed(0)}% historically ` +
+        `(need ≥${minWinRatePct}%, n=${emp.trades})`,
+      winRatePct,
+      trades: emp.trades,
+      maturity: emp.maturity,
+    };
+  }
+  return { ok: true, winRatePct, trades: emp.trades, maturity: emp.maturity };
 }
 
 module.exports = {
-  botRole,
-  isPrimaryBotRole,
-  isBackupBotRole,
-  botInstanceId,
-  coordinationPath,
-  coordStaleMs,
-  backupRescueMinStuckMs,
-  loadCoordination,
-  isCoordinationFresh,
-  publishPrimaryCoordination,
-  primaryOpenOnTicker,
-  primaryOpenOnWindow,
-  checkBackupEntryAllowed,
-  backupRescueCandidates,
-  coordinationTradeStub,
-  noteBackupRescueAttempt,
-  COORD_STALE_MS_DEFAULT,
-  BACKUP_RESCUE_MIN_STUCK_MS_DEFAULT,
+  bucketLabel,
+  maturityForTrades,
+  blendWeight,
+  lookupEmpiricalCalledRate,
+  calibrateProbabilityUp,
+  applyCalibrationToWindow,
+  applyWindowConsensus,
+  windowConsensusSupportsSide,
+  modelCalibrationEntryGate,
+  MIN_TRADES_TO_BLEND,
+  FULL_BLEND_TRADES,
 };
