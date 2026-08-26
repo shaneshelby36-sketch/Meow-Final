@@ -1,0 +1,42 @@
+{
+  "trades": [
+    {
+      "id": "t1",
+      "status": "open",
+      "mode": "paper",
+      "strategy": "model",
+      "symbol": "ETH",
+      "ticker": "T",
+      "side": "yes",
+      "contracts": 10,
+      "stakeDollars": 5,
+      "entryPriceCents": 55,
+      "windowCloseTime": 1787532816065,
+      "openedAt": 1787532081065,
+      "modelEntryHeldProb": 55,
+      "modelEntryBidCents": 55,
+      "modelEntrySpreadCents": 0,
+      "engineConfidence": 70,
+      "engineProbability": 55,
+      "peakHeldBidCents": 55,
+      "peakHeldBidAt": 1787532096072
+    }
+  ],
+  "reserveCents": 0,
+  "insuranceCents": 0,
+  "insuranceReady": false,
+  "insuranceDepositedCents": 0,
+  "retainedClosedPnlCents": 0,
+  "periodStartTime": 1787532065364,
+  "activityLog": [
+    {
+      "at": 1787532065373,
+      "message": "Closed ETH YES via model_against at 52¢ (cash P&L $-0.30).",
+      "kind": "close",
+      "symbol": "ETH",
+      "side": "yes",
+      "pnlCents": -30,
+      "tradeId": "t1"
+    }
+  ]
+}

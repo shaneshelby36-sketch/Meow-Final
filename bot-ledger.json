@@ -1,0 +1,21 @@
+{
+  "role": "primary",
+  "instanceId": "bot-25540",
+  "updatedAt": 1787532096073,
+  "openTrades": [
+    {
+      "id": "t1",
+      "ticker": "T",
+      "symbol": "ETH",
+      "side": "yes",
+      "windowCloseTime": 1787532816065,
+      "pendingForceExit": null,
+      "pendingForceExitSince": null,
+      "entryPriceCents": 55,
+      "contracts": 10,
+      "strategy": "model",
+      "mode": "paper",
+      "status": "open"
+    }
+  ]
+}

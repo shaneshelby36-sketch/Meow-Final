@@ -1,0 +1,1 @@
+Right — a stop from the previous 15m window shouldn’t keep blocking the next session. I’ll clear that recovery gate on session rollover.

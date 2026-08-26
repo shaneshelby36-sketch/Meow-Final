@@ -1,0 +1,1 @@
+Agreed — I’ll make the bounce gate expire when that session’s window closes so it doesn’t follow into the next one.
