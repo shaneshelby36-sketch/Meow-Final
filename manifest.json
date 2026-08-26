@@ -300,9 +300,6 @@
               <span class="stepper-value" id="bot-daily-loss-value">—</span>
               <button type="button" class="stepper-btn" id="bot-daily-loss-up">+</button>
             </div>
-            <div id="daily-loss-reset-row" style="display:none;margin-top:6px;">
-              <button type="button" class="btn-secondary" id="daily-loss-reset-btn" style="color:var(--down,#e55);border-color:var(--down,#e55);">🛑 Halted — Reset daily loss limit</button>
-            </div>
             <span class="field-hint">Kill-switch: halt all new entries for the rest of the day once realized losses hit this amount. Resets at midnight UTC. Default <strong>$5</strong>. <strong>$0</strong> = off.</span>
           </label>
           <label>Stake per trade

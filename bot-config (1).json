@@ -1053,9 +1053,6 @@ async function refreshBotStatus() {
     }
     if (data.lastDecision) chips.push(chip('Decision', data.lastDecision));
     if (data.lastError) chips.push(chip('Last error', data.lastError));
-    // Show/hide the daily loss reset button based on halt state.
-    const resetRow = document.getElementById('daily-loss-reset-row');
-    if (resetRow) resetRow.style.display = data.dailyLossHalted ? '' : 'none';
     renderSettleWindowRec(data.settleWindowRec);
     const activityScroll = captureLogScroll('bot-activity-log-list', 'bottom');
     const tradeScroll = captureLogScroll('bot-trade-log-list', 'top');
@@ -3292,18 +3289,6 @@ function wireBotUI() {
   document.getElementById('bot-dashboard-toggle').addEventListener('click', (event) => setBotRunning(event.currentTarget.dataset.running === 'true'));
   document.getElementById('bot-dashboard-open').addEventListener('click', openBotOverlay);
   document.getElementById('bot-reset-paper').addEventListener('click', resetPaperHistory);
-  document.getElementById('daily-loss-reset-btn')?.addEventListener('click', async () => {
-    const btn = document.getElementById('daily-loss-reset-btn');
-    if (btn) btn.disabled = true;
-    try {
-      const { engineUrl } = loadSettings();
-      await fetch(`${engineUrl}/api/bot/reset-daily-loss`, { method: 'POST' });
-      document.getElementById('daily-loss-reset-row').style.display = 'none';
-      refreshBotStatus();
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  });
   const botOverlay = document.getElementById('bot-overlay');
   if (botOverlay) {
     botOverlay.addEventListener('click', (event) => {
