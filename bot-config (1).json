@@ -1276,13 +1276,6 @@ function buildTradeLogHtml(tradeLog, tradeLogTotal) {
           ? ` · gross $${(t.pnlGrossCents / 100).toFixed(2)}`
           : '';
       const conf = Number.isFinite(t.engineConfidence) ? ` · conf ${t.engineConfidence}%` : '';
-      const entryLean = Number.isFinite(t.modelEntryHeldProb) ? Math.round(t.modelEntryHeldProb) : null;
-      const exitLean = Number.isFinite(t.modelExitHeldProb) ? Math.round(t.modelExitHeldProb) : null;
-      const leanNote = entryLean != null
-        ? exitLean != null
-          ? ` · lean ${entryLean}→${exitLean}%`
-          : ` · lean ${entryLean}%`
-        : '';
       let stopNote = '';
       let stopCopy = '';
       if (t.exitReason === 'stop_loss') {
@@ -1326,7 +1319,7 @@ function buildTradeLogHtml(tradeLog, tradeLogTotal) {
           <span class="bot-log-msg">
             <strong>${t.symbol || '?'} ${side}</strong>
             ${status} · ${entry}${t.status === 'closed' ? ` → ${exit}` : ''}
-            ${Number.isFinite(t.stakeDollars) ? ` · $${Number(t.stakeDollars).toFixed(2)}` : ''}${conf}${leanNote}${fees}${gross}${skim}
+            ${Number.isFinite(t.stakeDollars) ? ` · $${Number(t.stakeDollars).toFixed(2)}` : ''}${conf}${fees}${gross}${skim}
             <span class="bot-log-sub">opened ${formatTradeTime(t.openedAt)}${t.mode ? ` · ${t.mode}` : ''}</span>
             ${stopNote}
           </span>
@@ -1742,12 +1735,6 @@ const SLIDER_UNITS = {
 };
 
 function syncTradingSlidersFromConfig(c) {
-  const dailyLossEl = document.getElementById('bot-daily-loss-value');
-  if (dailyLossEl) {
-    const v = c.dailyLossLimitDollars != null ? c.dailyLossLimitDollars : 5;
-    dailyLossEl.textContent = v === 0 ? 'off' : `$${Number(v).toFixed(0)}`;
-    dailyLossEl.dataset.value = v;
-  }
   const stakeEl = document.getElementById('bot-stake');
   if (stakeEl) stakeEl.value = c.stakeDollars != null ? c.stakeDollars : 5;
   const maxEl = document.getElementById('bot-maxpos');
@@ -1760,7 +1747,6 @@ function syncTradingSlidersFromConfig(c) {
 
 function readTradingSlidersFromForm() {
   return {
-    dailyLossLimitDollars: parseFloat(document.getElementById('bot-daily-loss-value')?.dataset.value || '5'),
     stakeDollars: parseFloat(document.getElementById('bot-stake')?.value || '5'),
     maxOpenPositions: parseFloat(document.getElementById('bot-maxpos')?.value || '1'),
     secondOpenRequiresGreen: document.getElementById('bot-second-green')?.value || 'on',
@@ -3242,16 +3228,6 @@ function wireBotUI() {
     loadBotConfigIntoForm();
   });
   document.getElementById('bot-settings-save').addEventListener('click', () => saveBotConfig());
-  const dailyLossStep = (delta) => {
-    const el = document.getElementById('bot-daily-loss-value');
-    if (!el) return;
-    const cur = Number(el.dataset.value) || 5;
-    const next = Math.max(0, Math.min(500, cur + delta));
-    el.dataset.value = next;
-    el.textContent = next === 0 ? 'off' : `$${next}`;
-  };
-  document.getElementById('bot-daily-loss-down')?.addEventListener('click', () => dailyLossStep(-1));
-  document.getElementById('bot-daily-loss-up')?.addEventListener('click', () => dailyLossStep(1));
   const softLeanStep = (delta) => {
     const el = document.getElementById('bot-model-soft-lean-value');
     if (!el) return;

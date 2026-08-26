@@ -3161,14 +3161,7 @@ const EDITABLE_NUMERIC_FIELDS = [
   'insuranceFloorDollars',
   'insuranceOverflowDollars',
   'paperStartingBalanceDollars',
-  'dailyLossLimitDollars',
 ];
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DAILY LOSS LIMIT — change this number to adjust the default kill-switch level.
-// Set to 0 in config to disable entirely.
-// ─────────────────────────────────────────────────────────────────────────────
-const DAILY_LOSS_LIMIT_DEFAULT_DOLLARS = 5.00;
 
 /** Default arm ($10) / floor ($6) for insurance hysteresis; soft fill ceiling ($15). */
 const INSURANCE_ARM_DEFAULT = 10;
@@ -4328,7 +4321,6 @@ class TradingBot {
       insuranceCapDollars: INSURANCE_ARM_DEFAULT,
       insuranceFloorDollars: INSURANCE_FLOOR_DEFAULT,
       insuranceOverflowDollars: INSURANCE_OVERFLOW_DEFAULT,
-      dailyLossLimitDollars: DAILY_LOSS_LIMIT_DEFAULT_DOLLARS, // kill-switch: halt new entries when day P&L hits this loss
       paperStartingBalanceDollars: 100, // trading bankroll (also the capital backing paper trades)
       mode: 'paper', // 'paper' | 'live'
       liveAuthorized: false,
@@ -5180,66 +5172,6 @@ class TradingBot {
     this._logActivity(msg, { kind: 'halt' });
     this._persist();
     return true;
-  }
-
-  /**
-   * Daily loss limit kill-switch. Scans today's closed trades (net P&L after
-   * fees) and halts new entries for the rest of the calendar day if the
-   * configured limit is breached. Resets automatically at midnight UTC.
-   * Returns { ok: true } when trading can continue, { ok: false, reason } when halted.
-   */
-  _checkDailyLossLimit() {
-    if (this._inShadow) return { ok: true };
-    const limitDollars = Number(this.config.dailyLossLimitDollars);
-    if (!Number.isFinite(limitDollars) || limitDollars <= 0) return { ok: true };
-    const limitCents = Math.round(limitDollars * 100);
-
-    // Determine start-of-today in UTC ms.
-    const now = Date.now();
-    const todayStartMs = (() => {
-      const d = new Date(now);
-      return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
-    })();
-
-    // If already halted today, stay halted without re-scanning every cycle.
-    if (
-      this._dailyLossHaltedAt &&
-      this._dailyLossHaltedAt >= todayStartMs
-    ) {
-      const lostDollars = (Math.abs(this._dailyLossCents || 0) / 100).toFixed(2);
-      return {
-        ok: false,
-        reason: `🛑 Daily loss limit: −$${lostDollars} reached −$${limitDollars.toFixed(2)} — new trades halted for today.`,
-      };
-    }
-
-    // Sum net P&L (after fees) for all trades closed today.
-    const trades = this.ledger && Array.isArray(this.ledger.trades) ? this.ledger.trades : [];
-    let dayPnlCents = 0;
-    for (const t of trades) {
-      if (!t || t.status !== 'closed') continue;
-      const closedAt = Number(t.closedAt);
-      if (!Number.isFinite(closedAt) || closedAt < todayStartMs) continue;
-      dayPnlCents += Number(t.pnlCents) || 0;
-    }
-
-    if (dayPnlCents <= -limitCents) {
-      this._dailyLossHaltedAt = now;
-      this._dailyLossCents = dayPnlCents;
-      const lostDollars = (Math.abs(dayPnlCents) / 100).toFixed(2);
-      const msg = `🛑 DAILY LOSS LIMIT HIT: −$${lostDollars} (limit −$${limitDollars.toFixed(2)}) — NEW TRADES HALTED for the rest of today.`;
-      console.warn(`[bot] ${msg}`);
-      this._logActivity(msg, { kind: 'halt' });
-      this._persist();
-      return { ok: false, reason: msg };
-    }
-
-    // Clear any stale halt from a previous day.
-    if (this._dailyLossHaltedAt && this._dailyLossHaltedAt < todayStartMs) {
-      this._dailyLossHaltedAt = null;
-      this._dailyLossCents = null;
-    }
-    return { ok: true };
   }
 
   /**
@@ -6692,11 +6624,6 @@ class TradingBot {
       trade.closedAt = Date.now();
       trade.exitPriceCents = bookedExit;
       trade.exitReason = reason;
-      const exitProb = opts.exitHeldProb ?? trade._liveExitHeldProb;
-      if (exitProb != null && Number.isFinite(Number(exitProb))) {
-        trade.modelExitHeldProb = +Number(exitProb).toFixed(1);
-      }
-      delete trade._liveExitHeldProb;
       // Clear miss cooldown/streak for this coin once we're done with the ticket.
       this._clearEntryMiss(trade.symbol, trade.side);
       // MODEL: after a full exit, require a fresh under-50¢ print before rebuy (YES or NO).
@@ -7727,13 +7654,6 @@ class TradingBot {
       const minConf = Number.isFinite(Number(this.config.modelMinConfidence))
         ? Number(this.config.modelMinConfidence)
         : MODEL_MIN_CONFIDENCE_DEFAULT;
-      const liveHeldProb = picked && picked.window
-        ? modelHeldSideProb(picked.window, trade.side)
-        : null;
-      // Stamp exit lean on the trade every cycle so _closePosition always has the latest value.
-      if (Number.isFinite(liveHeldProb)) {
-        trade._liveExitHeldProb = +Number(liveHeldProb).toFixed(1);
-      }
       const entryHeldProbRaw = Number(trade.modelEntryHeldProb);
       const entryHeldProb = Number.isFinite(entryHeldProbRaw)
         ? entryHeldProbRaw
@@ -9470,11 +9390,6 @@ class TradingBot {
     try {
     if (!this.isRunning) {
       this.lastDecision = 'Bot is stopped; it will continue monitoring any already-open positions but will not open new ones.';
-      return;
-    }
-    const dailyLimitCheck = this._checkDailyLossLimit();
-    if (!dailyLimitCheck.ok) {
-      this.lastDecision = dailyLimitCheck.reason;
       return;
     }
     if (isBackupBotRole()) {

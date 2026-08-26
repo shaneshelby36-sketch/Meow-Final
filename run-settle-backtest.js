@@ -1,122 +1,154 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-
 /**
- * Where bot settings, ledger, calibration, and credentials are stored.
+ * A/B settle backtest: hold+stop vs entry-tiered TP/stale exits.
+ * Prefers Coinbase 1m candles; falls back to seeded synthetic paths if fetch fails.
+ * Kalshi books are always synthesized from spot (no historical order books).
  *
- * Locally, `./data` survives reboots. On Render, the app directory is wiped on
- * every restart/deploy — attach a Persistent Disk (usually mounted at
- * `/var/data`) and set DATA_DIR, or leave DATA_DIR unset and we will use
- * `/var/data` automatically when that mount is writable.
+ *   node run-settle-backtest.js [hours]
  */
-const DEFAULT_LOCAL_DIR = path.join(__dirname, 'data');
-const RENDER_DISK_CANDIDATE = '/var/data';
-const ON_RENDER = Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID);
 
-function canUseDir(dir) {
-  try {
-    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return false;
-    fs.accessSync(dir, fs.constants.W_OK);
-    return true;
-  } catch {
-    return false;
+const { fetchHistoricalRange } = require('./candles');
+const { backtestWithSettings } = require('./backtest');
+
+const HOURS = Math.max(24, Number(process.argv[2]) || 168); // default 7 days
+const PRODUCTS = {
+  BTC: 'BTC-USD',
+  ETH: 'ETH-USD',
+  SOL: 'SOL-USD',
+  XRP: 'XRP-USD',
+};
+const START_PRICES = { BTC: 65000, ETH: 3400, SOL: 160, XRP: 0.62 };
+
+/** Deterministic minute bars so A/B compare is apples-to-apples offline. */
+function syntheticCandles(symbol, hours, seed = 42) {
+  const n = Math.round(hours * 60);
+  const start = Date.now() - n * 60 * 1000;
+  let price = START_PRICES[symbol] || 100;
+  let s = seed + symbol.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
+  const rand = () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 0xffffffff;
+  };
+  const out = [];
+  for (let i = 0; i < n; i += 1) {
+    // ~crypto-ish minute vol + mild mean reversion bursts
+    const shock = (rand() - 0.5) * 0.0028 + (rand() < 0.03 ? (rand() - 0.5) * 0.01 : 0);
+    const open = price;
+    const close = Math.max(0.0001, open * (1 + shock));
+    const high = Math.max(open, close) * (1 + rand() * 0.0006);
+    const low = Math.min(open, close) * (1 - rand() * 0.0006);
+    out.push({
+      time: start + i * 60 * 1000,
+      open,
+      high,
+      low,
+      close,
+      volume: 10 + rand() * 100,
+    });
+    price = close;
   }
+  return out;
 }
 
-function resolveDataDir() {
-  if (process.env.DATA_DIR) return path.resolve(process.env.DATA_DIR);
-  if (canUseDir(RENDER_DISK_CANDIDATE)) return path.resolve(RENDER_DISK_CANDIDATE);
-  return DEFAULT_LOCAL_DIR;
+const BASE = {
+  strategyMode: 'settle',
+  minConfidence: 55,
+  settleEntryMinCents: 80,
+  settleEntryMaxCents: 95,
+  settleStopLossCents: 8,
+  settleMinMinutesToOpen: 0.5,
+  settleMaxMinutesToOpen: 12,
+  stakeDollars: 5,
+  maxOpenPositions: 1,
+  paperStartingBalanceDollars: 150,
+  skimMode: 'off',
+  stopRecoveryCents: 0,
+  postStopSameSideCooldownMinutes: 0,
+};
+
+function fmt(cents) {
+  const n = (Number(cents) || 0) / 100;
+  return `${n >= 0 ? '+' : ''}$${n.toFixed(2)}`;
 }
 
-const DATA_DIR = resolveDataDir();
-// True when Render would wipe this path on restart (app dir, no persistent disk).
-const DATA_DIR_EPHEMERAL = ON_RENDER && path.resolve(DATA_DIR) === path.resolve(DEFAULT_LOCAL_DIR);
-const DATA_DIR_FROM_ENV = Boolean(process.env.DATA_DIR);
-
-function ensureDataDir() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(path.join(DATA_DIR, 'archive'), { recursive: true });
+function summarize(label, r) {
+  return {
+    label,
+    trades: r.trades,
+    winRatePct: r.winRatePct,
+    netPnl: fmt(r.netPnlCents),
+    netPnlCents: r.netPnlCents,
+    stopLossExits: r.stopLossExits,
+    takeProfitExits: r.takeProfitExits,
+    settleStaleExits: r.settleStaleExits,
+    settledExits: r.settledExits,
+    tradesBySymbol: r.tradesBySymbol,
+  };
 }
 
-function dataPath(...parts) {
-  return path.join(DATA_DIR, ...parts);
-}
-
-/**
- * How long to keep rotated ledger/tracker/trade-log snapshots under
- * data/archive/. Default 14 days (matches a biweekly top-up cadence).
- * Set ARCHIVE_RETENTION_DAYS=0 to disable pruning.
- */
-const ARCHIVE_RETENTION_DAYS = (() => {
-  const raw = process.env.ARCHIVE_RETENTION_DAYS;
-  if (raw === undefined || raw === '') return 14;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 14;
-})();
-
-/**
- * Deletes archive/*.json older than ARCHIVE_RETENTION_DAYS.
- * Live files (bot-ledger.json, trade-log.json, config, calibration) are never touched.
- */
-function pruneArchiveFiles({ now = Date.now() } = {}) {
-  if (!ARCHIVE_RETENTION_DAYS || ARCHIVE_RETENTION_DAYS <= 0) {
-    return { deleted: 0, kept: 0, retentionDays: ARCHIVE_RETENTION_DAYS };
-  }
-  const archiveDir = path.join(DATA_DIR, 'archive');
-  const cutoff = now - ARCHIVE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  let deleted = 0;
-  let kept = 0;
+async function loadCandles() {
+  const candlesBySymbol = {};
+  let source = 'coinbase';
+  console.log(`Loading ~${HOURS}h 1m candles for ${Object.keys(PRODUCTS).join(', ')}…`);
   try {
-    if (!fs.existsSync(archiveDir)) return { deleted: 0, kept: 0, retentionDays: ARCHIVE_RETENTION_DAYS };
-    for (const name of fs.readdirSync(archiveDir)) {
-      if (!name.endsWith('.json')) continue;
-      const full = path.join(archiveDir, name);
-      let mtime;
-      try {
-        mtime = fs.statSync(full).mtimeMs;
-      } catch {
-        continue;
-      }
-      if (mtime < cutoff) {
-        try {
-          fs.unlinkSync(full);
-          deleted += 1;
-        } catch (err) {
-          console.error(`[paths] failed to prune archive ${name}:`, err.message);
-        }
-      } else {
-        kept += 1;
-      }
+    for (const [sym, product] of Object.entries(PRODUCTS)) {
+      process.stdout.write(`  ${sym}… `);
+      candlesBySymbol[sym] = await fetchHistoricalRange(product, HOURS);
+      console.log(`${candlesBySymbol[sym].length} bars`);
     }
   } catch (err) {
-    console.error('[paths] archive prune failed:', err.message);
+    source = 'synthetic';
+    console.warn(`\nCoinbase fetch failed (${err.message}) — using seeded synthetic paths.`);
+    for (const sym of Object.keys(PRODUCTS)) {
+      candlesBySymbol[sym] = syntheticCandles(sym, HOURS);
+      console.log(`  ${sym}: ${candlesBySymbol[sym].length} synthetic bars`);
+    }
   }
-  if (deleted > 0) {
+  return { candlesBySymbol, source };
+}
+
+async function main() {
+  const { candlesBySymbol, source } = await loadCandles();
+
+  const opts = { stepMinutes: 1, mode: 'AUTO', continuousSearch: true };
+
+  console.log('\nRunning settle HOLD (stop + settle only)…');
+  const hold = backtestWithSettings(
+    candlesBySymbol,
+    { ...BASE, settleTieredExits: false },
+    opts
+  );
+
+  console.log('Running settle TIERED (TP + stale by entry)…');
+  const tiered = backtestWithSettings(
+    candlesBySymbol,
+    { ...BASE, settleTieredExits: true },
+    opts
+  );
+
+  const a = summarize('hold+stop', hold);
+  const b = summarize('tiered exits', tiered);
+  const delta = (tiered.netPnlCents || 0) - (hold.netPnlCents || 0);
+
+  console.log('\n══ Settle backtest (Kalshi marks synthesized from spot) ══');
+  console.log(
+    JSON.stringify(
+      { hours: HOURS, candleSource: source, hold: a, tiered: b, tieredMinusHold: fmt(delta) },
+      null,
+      2
+    )
+  );
+  console.log('\nNote:', tiered.note);
+  console.log('\nRecent tiered exits:');
+  for (const t of (tiered.recentTrades || []).slice(0, 12)) {
     console.log(
-      `[paths] pruned ${deleted} archive file(s) older than ${ARCHIVE_RETENTION_DAYS}d (${kept} kept)`
+      `  ${t.symbol} ${String(t.side).toUpperCase()} conf ${t.confidence} → ${t.exitReason} ${t.pnlDollars >= 0 ? '+' : ''}$${Number(t.pnlDollars).toFixed(2)}`
     );
   }
-  return { deleted, kept, retentionDays: ARCHIVE_RETENTION_DAYS };
 }
 
-/** Atomic JSON write so a crash mid-save cannot leave a half-written config. */
-function writeJsonAtomic(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
-  fs.renameSync(tmp, filePath);
-}
-
-module.exports = {
-  DATA_DIR,
-  DATA_DIR_EPHEMERAL,
-  DATA_DIR_FROM_ENV,
-  ARCHIVE_RETENTION_DAYS,
-  ensureDataDir,
-  dataPath,
-  pruneArchiveFiles,
-  writeJsonAtomic,
-};
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
